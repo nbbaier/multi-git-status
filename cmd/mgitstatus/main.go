@@ -15,6 +15,55 @@ import (
 
 const version = "2.3"
 
+type orderedPrinter struct {
+	mu     sync.Mutex
+	next   int
+	buffer map[int]indexedResult
+	fmt    *output.Formatter
+}
+
+type indexedResult struct {
+	index  int
+	status repo.Status
+	isRepo bool
+	path   string
+}
+
+func (o *orderedPrinter) add(idx int, r indexedResult, warnNotRepo bool) {
+	var batch []indexedResult
+	o.mu.Lock()
+	if o.buffer == nil {
+		o.buffer = make(map[int]indexedResult)
+	}
+	o.buffer[idx] = r
+	for {
+		r, ok := o.buffer[o.next]
+		if !ok {
+			break
+		}
+		delete(o.buffer, o.next)
+		o.next++
+		batch = append(batch, r)
+	}
+	o.mu.Unlock()
+	for _, r := range batch {
+		printOne(o.fmt, r, warnNotRepo)
+	}
+}
+
+func printOne(formatter *output.Formatter, r indexedResult, warnNotRepo bool) {
+	if r.path == "" {
+		return
+	}
+	if !r.isRepo {
+		if warnNotRepo && r.path != "." {
+			formatter.PrintError(r.path, "not_a_repo")
+		}
+		return
+	}
+	formatter.PrintStatus(r.status)
+}
+
 func main() {
 	// CLI flags
 	showBranch := flag.Bool("b", false, "Show currently checked out branch")
@@ -35,6 +84,7 @@ func main() {
 	noStashes := flag.Bool("no-stashes", false, "Suppress stash count")
 	throttle := flag.Int("throttle", 0, "Wait SEC seconds between each 'git fetch' (-f option)")
 	showVersion := flag.Bool("version", false, "Show version")
+	noStream := flag.Bool("no-stream", false, "Wait until all repos are checked before printing")
 
 	// Override default usage
 	flag.Usage = func() {
@@ -44,7 +94,8 @@ Usage: %s [--version] [-w] [-e] [-f] [--throttle SEC] [-c] [-d/--depth=2] [--fla
 mgitstatus shows uncommitted, untracked and unpushed changes in multiple Git
 repositories. By default, mgitstatus scans two directories deep. This can be
 changed with the -d (--depth) option.  If DEPTH is 0, the scan is infinitely
-deep.
+deep. Results print as each repo is checked (in scan order); use --no-stream
+to buffer all output until the run finishes.
 
   -b               Show currently checked out branch
   -c               Force color output (preserve colors when using pipes)
@@ -68,6 +119,7 @@ You can limit output with the following options:
   --no-untracked
   --no-stashes
   --no-ok          (same as -e)
+  --no-stream      Buffer output until every repo has finished checking
 `, os.Args[0])
 	}
 
@@ -115,17 +167,13 @@ You can limit output with the following options:
 		fmt.Fprintf(os.Stderr, "DEBUG: found %d directories\n", len(entries))
 	}
 
-	// Filter to repos and non-repos, preserving discovery order
-	type indexedResult struct {
-		index  int
-		status repo.Status
-		isRepo bool
-		path   string
-	}
-
 	results := make([]indexedResult, len(entries))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, runtime.NumCPU())
+	var op *orderedPrinter
+	if !*noStream {
+		op = &orderedPrinter{fmt: formatter}
+	}
 
 	for i, entry := range entries {
 		if !entry.IsRepo {
@@ -134,15 +182,20 @@ You can limit output with the following options:
 				isRepo: false,
 				path:   entry.Path,
 			}
+			if op != nil {
+				op.add(i, results[i], *warnNotRepo)
+			}
 			continue
 		}
 
-		// Check if repo should be ignored
 		if repo.ShouldIgnore(entry.Path) {
 			results[i] = indexedResult{
 				index:  i,
-				isRepo: false, // treat as skip
-				path:   "",    // empty path = skip silently
+				isRepo: false,
+				path:   "",
+			}
+			if op != nil {
+				op.add(i, results[i], *warnNotRepo)
 			}
 			continue
 		}
@@ -158,30 +211,25 @@ You can limit output with the following options:
 			}
 
 			s := repo.Check(path, opts)
-			results[idx] = indexedResult{
+			r := indexedResult{
 				index:  idx,
 				status: s,
 				isRepo: true,
 				path:   path,
+			}
+			if op != nil {
+				op.add(idx, r, *warnNotRepo)
+			} else {
+				results[idx] = r
 			}
 		}(i, entry.Path)
 	}
 
 	wg.Wait()
 
-	// Print results in discovery order
-	for _, r := range results {
-		if r.path == "" {
-			continue // silently skipped (ignored repo)
+	if op == nil {
+		for _, r := range results {
+			printOne(formatter, r, *warnNotRepo)
 		}
-
-		if !r.isRepo {
-			if *warnNotRepo && r.path != "." {
-				formatter.PrintError(r.path, "not_a_repo")
-			}
-			continue
-		}
-
-		formatter.PrintStatus(r.status)
 	}
 }
